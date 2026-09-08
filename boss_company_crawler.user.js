@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Boss直聘-公司名批量导出
 // @namespace    boss-zhipin-company-crawler
-// @version      1.1.1
-// @description  按当前网址的搜索条件采集公司显示名称，支持暂停续采、当前页采集、去重和 CSV 导出；不保证工商全称
+// @version      1.2.0
+// @description  采集职位页面已加载的公司名称，支持自动下滚、暂停、去重与CSV导出；不调用旧接口，不保证工商全称
 // @author       Mavis
 // @homepageURL  https://github.com/wuy705464-ai/boss-company-crawler
 // @downloadURL  https://raw.githubusercontent.com/wuy705464-ai/boss-company-crawler/main/boss_company_crawler.user.js
@@ -21,9 +21,8 @@
 
     const STORAGE_KEY = 'boss_company_crawler_v2';
     const LEGACY_KEY = 'boss_company_crawler_v1';
-    const PAGE_SIZE = 30;
-    const REQUEST_TIMEOUT = 20000;
-    const PAGE_DELAY = [4000, 7000];
+    const IDLE_TIMEOUT = 45000;
+    const SCROLL_DELAY = 5000;
     const MAX_PAGE = 500;
     const cleanName = value => typeof value === 'string'
         ? value.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim() : '';
@@ -38,11 +37,11 @@
         params.delete('page');
         params.delete('pageSize');
         params.sort();
-        const query = params.get('query') || params.get('keyword') || '未指定关键词';
-        const city = params.get('city') || '未指定城市（网站默认）';
+        const query = params.get('query') || params.get('keyword') || '';
+        const city = params.get('city') || '';
         return {
             key: params.toString(), params,
-            label: `${query} · 城市 ${city}`,
+            label: [query, city ? `城市 ${city}` : ''].filter(Boolean).join(' · ') || '当前页面（地区与关键词以网站选择为准）',
             url: `${current.origin}${current.pathname}?${params}`
         };
     }
@@ -81,7 +80,7 @@
     let state;
     let names;
     let activeRun = null;
-    let message = '就绪。先确认页面筛选条件；自动采集从第 1 页开始。';
+    let message = '页面采集模式：先在 Boss 选择地区和关键词，等公司卡片出现后开始。';
     let messageType = '';
     let collapsed = false;
 
@@ -122,168 +121,132 @@
         return added;
     }
 
-    function saveCheckpoint(page, fingerprint, completed) {
-        const previousPage = state.pagesDone;
-        const previousCompleted = state.completed;
-        const previousLength = state.fingerprints.length;
-        state.pagesDone = page;
-        state.completed = completed;
-        if (fingerprint) state.fingerprints.push(fingerprint);
-        try { saveState(); }
-        catch (e) {
-            // 保存失败保留已读名称供导出，但回滚页码，恢复后重读本页。
-            state.pagesDone = previousPage;
-            state.completed = previousCompleted;
-            state.fingerprints.length = previousLength;
-            throw e;
-        }
+
+    const CARD_SELECTOR = '.job-card-wrapper, .job-card-box, .job-card-wrap, .job-card';
+    const NAME_SELECTOR = '.company-name, .company-title, .company-info .company-text';
+
+    function visible(element) {
+        if (!element || !element.getClientRects().length || element.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden';
     }
 
-    function domItems() {
-        const items = [];
-        const cards = document.querySelectorAll('.job-card-wrapper, .job-card-box');
+    function readPage() {
+        const cards = [...document.querySelectorAll(CARD_SELECTOR)].filter(visible);
+        const candidates = new Set();
         for (const card of cards) {
-            const parent = card.querySelector('.company-name');
-            const link = parent && (parent.querySelector('a') || parent);
-            if (!link) continue;
-            const candidates = [link.getAttribute('title'), parent.getAttribute('title'), link.textContent];
-            const name = candidates.map(cleanName).find(validName);
+            for (const element of card.querySelectorAll(NAME_SELECTOR)) candidates.add(element);
+            for (const link of card.querySelectorAll('a[href*="/gongsi/"]')) {
+                const label = link.querySelector(NAME_SELECTOR);
+                if (label) candidates.add(label);
+                else if (!link.querySelector('.company-tag-list, .company-tag, .company-info, p')) candidates.add(link);
+            }
+        }
+        // 卡片外壳变化时仍可识别明确的公司名节点，不使用招聘者姓名。
+        for (const element of document.querySelectorAll('.company-name')) {
+            if (!element.closest('#bp-panel')) candidates.add(element);
+        }
+        const items = [];
+        for (const element of candidates) {
+            if (!visible(element)) continue;
+            const link = element.querySelector('a') || element;
+            const name = [link.getAttribute('title'), element.getAttribute('title'), link.textContent]
+                .map(cleanName).find(validName);
             if (name) items.push({ name });
         }
-        return items;
-    }
-
-    function parsePage(json) {
-        if (!json || json.code !== 0) {
-            throw new Error(`接口未成功（${json && json.code != null ? json.code : '未知状态'}）：${errorText(json && json.message || '请检查登录或验证页面')}`);
-        }
-        const data = json.zpData;
-        if (!data || !Array.isArray(data.jobList)) throw new Error('接口结构变化：缺少 jobList，未推进页码');
-        const jobs = data.jobList;
-        const items = jobs.map(job => {
-            if (!job || typeof job !== 'object') return { name: '' };
-            const name = [job.companyName, job.brandName].map(cleanName).find(validName) || '';
-            return { name };
-        }).filter(item => validName(item.name));
-        if (jobs.length && !items.length) throw new Error('本页有职位但无法识别公司名称，未推进页码');
-        // 用职位身份检测重复页，不能用公司名称：不同职位页可能属于同一批公司。
-        const identities = jobs.map(job => job && (job.encryptJobId || job.jobId)
-            ? `id:${job.encryptJobId || job.jobId}` : JSON.stringify(job));
-        const fingerprint = JSON.stringify(identities.sort());
-        const hasMore = data.hasMore === false || data.hasMore === 0 || data.hasMore === 'false' || data.hasMore === '0'
-            ? false : data.hasMore === true || data.hasMore === 1 || data.hasMore === 'true' || data.hasMore === '1' ? true : null;
-        return { items, fingerprint, count: jobs.length, hasMore };
-    }
-
-    async function fetchPage(page, run) {
-        const params = new URLSearchParams(run.context.params);
-        params.set('page', String(page));
-        params.set('pageSize', String(PAGE_SIZE));
-        const controller = new AbortController();
-        run.controller = controller;
-        let timedOut = false;
-        const timer = setTimeout(() => { timedOut = true; controller.abort(); }, REQUEST_TIMEOUT);
-        try {
-            const response = await fetch(`/wapi/zpgeek/job/list.json?${params}`, {
-                credentials: 'include', signal: controller.signal,
-                headers: { accept: 'application/json, text/plain, */*' }
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}，请检查网站是否要求登录或验证`);
-            let json;
-            try { json = await response.json(); }
-            catch (e) {
-                if (controller.signal.aborted) throw e;
-                throw new Error('返回内容不是 JSON，可能需要登录或验证');
-            }
-            return parsePage(json);
-        } catch (e) {
-            if (timedOut) throw new Error('请求超过 20 秒，已暂停，可稍后继续');
-            throw e;
-        } finally {
-            clearTimeout(timer);
-            if (run.controller === controller) run.controller = null;
-        }
-    }
-
-    function delay(run) {
-        return new Promise(resolve => {
-            const timer = setTimeout(finish, PAGE_DELAY[0] + Math.random() * (PAGE_DELAY[1] - PAGE_DELAY[0]));
-            function finish() { clearTimeout(timer); run.wake = null; resolve(); }
-            run.wake = finish;
+        const identities = cards.map(card => {
+            const link = card.querySelector('a[href*="/job_detail/"]');
+            return link ? link.getAttribute('href').split('?')[0] : cleanName(card.textContent);
         });
+        return { items: normalizeItems(items), cards,
+            signature: JSON.stringify([identities.sort(), items.map(item => item.name).sort()]) };
     }
 
-    function stopRun(text = '已暂停，已保存的页码可继续。') {
-        const run = activeRun;
-        activeRun = null; // 先使旧循环失效，保证迟到响应无法写回。
-        if (run) {
-            run.cancelled = true;
-            if (run.controller) run.controller.abort();
-            if (run.wake) run.wake();
+    function blockingNotice() {
+        for (const element of document.querySelectorAll('[role="dialog"], .verify-dialog, .verify-wrap, .captcha-box, .login-dialog')) {
+            if (visible(element) && /验证|验证码|登录|操作频繁|访问异常/.test(element.textContent)) return true;
         }
-        setStatus(text);
+        return false;
+    }
+
+    function scrollResults(cards) {
+        if (!cards.length) return;
+        let parent = cards[cards.length - 1].parentElement;
+        while (parent && parent !== document.body && parent !== document.documentElement) {
+            if (/(auto|scroll)/.test(getComputedStyle(parent).overflowY) && parent.scrollHeight > parent.clientHeight + 8) {
+                parent.scrollBy({ top: Math.max(200, parent.clientHeight * 0.8), behavior: 'smooth' });
+                return;
+            }
+            parent = parent.parentElement;
+        }
+        window.scrollBy({ top: Math.max(200, window.innerHeight * 0.8), behavior: 'smooth' });
+    }
+
+    function stopRun(text = '已暂停，已采集的公司保留，可导出或继续。', type = '') {
+        const run = activeRun;
+        activeRun = null;
+        if (run) clearInterval(run.timer);
+        setStatus(text, type);
     }
 
     function syncContext() {
         const next = searchContext();
         if (next.key === context.key) return false;
-        stopRun();
-        context = next;
-        selectDataset();
-        setStatus('搜索条件已改变，已切换到对应进度；请等待页面结果加载后再采集。');
+        stopRun(); context = next; selectDataset();
+        setStatus('网址搜索条件已改变，已暂停并切换对应数据。等页面结果加载后再开始。');
         return true;
     }
 
-    async function crawlLoop() {
+    function tick(run) {
+        if (activeRun !== run || syncContext()) return;
+        try {
+            if (blockingNotice()) return stopRun('检测到登录或验证提示，已暂停。请在网站正常处理后继续。', 'error');
+            const page = readPage();
+            const added = mergeItems(page.items, '页面');
+            if (added || run.needsSave) { saveState(); run.needsSave = false; }
+            const now = Date.now();
+            if (page.items.length && page.signature !== run.signature) {
+                run.signature = page.signature;
+                run.lastChange = now;
+            }
+            if (now - run.lastChange >= IDLE_TIMEOUT) {
+                return stopRun(page.items.length ? '45 秒没有出现新职位，已暂停。可手动翻页后继续；不代表已采集全部。'
+                    : '没有读到公司卡片，已暂停。请先搜索并等待职位列表加载。', 'error');
+            }
+            setStatus(page.items.length ? '采集中：页面读到 ' + page.items.length + ' 家，本轮新增 ' + added + ' 家，累计 ' + state.companies.length + ' 家。'
+                : '等待公司卡片加载…请在网站搜索或滚动到职位列表。', added ? 'success' : '');
+            if (ui.autoscroll.checked && now - run.lastScroll >= SCROLL_DELAY) {
+                scrollResults(page.cards); run.lastScroll = now;
+            }
+        } catch (e) { stopRun(errorText(e), 'error'); }
+    }
+
+    function startRun() {
         if (activeRun) return;
         syncContext();
         if (storageIssue) return setStatus(storageIssue, 'error');
-        if (state.completed) return setStatus('该搜索已到末页。如需更新，点击“从头重扫”（保留已有公司）。');
-        const limit = Number(ui.limit.value);
-        if (!Number.isInteger(limit) || limit < 1 || limit > 100) return setStatus('单次采集页数请填 1–100。', 'error');
-        const run = { cancelled: false, context, controller: null, wake: null };
+        const run = { signature: '', lastChange: Date.now(), lastScroll: Date.now(), needsSave: true };
         activeRun = run;
-        updatePanel();
-        try {
-            for (let done = 0; done < limit; done++) {
-                if (activeRun !== run || run.cancelled || syncContext()) return;
-                const page = state.pagesDone + 1;
-                if (page > MAX_PAGE) { setStatus('已达 500 页上限，请缩小搜索范围。'); break; }
-                setStatus(`正在读取第 ${page} 页…`);
-                const result = await fetchPage(page, run);
-                if (activeRun !== run || run.cancelled || syncContext()) return;
-                if (result.count === 0) {
-                    if (result.hasMore === true) throw new Error('接口返回空页却标记还有下一页，已停止，未推进页码');
-                    saveCheckpoint(state.pagesDone, null, true);
-                    setStatus(`已到末页，共 ${state.companies.length} 家公司。`, 'success');
-                    break;
-                }
-                if (state.fingerprints.includes(result.fingerprint)) {
-                    throw new Error('接口返回了已经采集过的职位页，已停止，未推进页码');
-                }
-                const added = mergeItems(result.items, 'API');
-                saveCheckpoint(page, result.fingerprint, result.hasMore === false);
-                setStatus(`第 ${page} 页新增 ${added} 家，累计 ${state.companies.length} 家。${state.completed ? '已到末页。' : done + 1 === limit ? '本轮完成，可继续。' : ''}`, 'success');
-                if (state.completed || done + 1 === limit) break;
-                await delay(run);
-            }
-        } catch (e) {
-            if (activeRun === run && !run.cancelled) setStatus(`已停止：${errorText(e)}`, 'error');
-        } finally {
-            if (activeRun === run) { activeRun = null; updatePanel(); }
-        }
+        tick(run);
+        if (activeRun === run) run.timer = setInterval(() => tick(run), 1000);
     }
 
     function collectCurrentPage() {
-        if (activeRun) return;
+        stopRun();
         if (syncContext()) return;
+        if (storageIssue) return setStatus(storageIssue, 'error');
         try {
-            const items = domItems();
-            if (!items.length) return setStatus('没有找到可识别的公司名称；请确认职位卡片已加载，或网站布局已变化。', 'error');
-            const added = mergeItems(items, 'DOM');
+            if (blockingNotice()) return setStatus('请先在网站正常处理登录或验证。', 'error');
+            const { items } = readPage();
+            if (!items.length) return setStatus('没有找到公司卡片，请先在网站搜索并等待列表加载。', 'error');
+            const added = mergeItems(items, '页面');
             saveState();
-            setStatus(`当前页新增 ${added} 家（读到 ${items.length} 条）。手动采集不改变 API 页码。`, 'success');
+            setStatus('当前页面读到 ' + items.length + ' 家，新增 ' + added + ' 家，累计 ' + state.companies.length + ' 家。', 'success');
         } catch (e) { setStatus(errorText(e), 'error'); }
+    }
+
+    function allHistory() {
+        return normalizeItems([...Object.values(store.datasets).flatMap(data => Array.isArray(data && data.companies) ? data.companies : []), ...legacyItems]);
     }
 
     function csvCell(value) {
@@ -317,14 +280,16 @@
         if (syncContext()) return;
         if (clear && !confirm('确认清空当前搜索的公司和进度？其他搜索及旧版数据不受影响。')) return;
         stopRun();
-        if (clear) { state.companies = []; names.clear(); }
+        const previousItems = state.companies;
+        if (clear) state.companies = [];
         state.pagesDone = 0;
         state.fingerprints = [];
         state.completed = false;
         try {
             saveState();
-            setStatus(clear ? '当前搜索的数据已清空。' : '已重置为第 1 页，已有公司保留，点击开始采集即可更新。');
-        } catch (e) { setStatus(errorText(e), 'error'); }
+            if (clear) names.clear();
+            setStatus('当前搜索的数据已清空。');
+        } catch (e) { state.companies = previousItems; setStatus(errorText(e), 'error'); }
     }
 
     GM_addStyle(`
@@ -337,7 +302,7 @@
         #bp-panel .bp-btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
         #bp-panel button{background:#fff;color:#00876a;border:1px solid #00a980;padding:5px 9px;border-radius:4px;cursor:pointer;font:inherit}
         #bp-panel button:disabled{opacity:.45;cursor:default} #bp-panel .bp-primary{background:#00876a;color:#fff}
-        #bp-panel input{width:60px;padding:3px;border:1px solid #bbb;color:#333;background:#fff;font:inherit}
+        #bp-panel input{width:auto;padding:3px;border:1px solid #bbb;color:#333;background:#fff;font:inherit}
         #bp-panel .bp-note{font-size:12px;color:#666;margin-top:8px}
         #bp-panel .bp-status{margin-top:8px;padding:6px 8px;background:#f5f5f5;border-radius:4px;font-size:12px;overflow-wrap:anywhere}
         #bp-panel .bp-status.error{background:#fff0f0;color:#b22} #bp-panel .bp-status.success{background:#eef9f4;color:#087153}
@@ -346,23 +311,23 @@
     panel.id = 'bp-panel';
     // 此模板只有静态标记；公司名、搜索参数和接口消息一律通过 textContent 写入。
     panel.innerHTML = `
-        <div class="bp-title">🏢 Boss 公司名采集 <button id="bp-collapse" aria-label="折叠采集面板" aria-expanded="true">收起</button></div>
+        <div class="bp-title">🏢 Boss 公司采集 v1.2.0 <button id="bp-collapse" aria-label="折叠采集面板" aria-expanded="true">收起</button></div>
         <div id="bp-body">
             <div class="bp-row" id="bp-target"></div>
-            <div class="bp-row">去重公司：<b id="bp-count">0</b> 家 · API 已完成：<b id="bp-pages">0</b> 页</div>
-            <label>单次最多 <input id="bp-limit" type="number" min="1" max="100" value="20"> 页</label>
+            <div class="bp-row">页面采集 · 去重公司：<b id="bp-count">0</b> 家</div>
+            <label><input id="bp-autoscroll" type="checkbox" checked>自动向下滚动加载结果</label>
             <div class="bp-btns">
-                <button class="bp-primary" id="bp-start">开始 / 继续</button>
+                <button class="bp-primary" id="bp-start">开始采集</button>
                 <button id="bp-dom">采集当前页</button><button id="bp-export">导出 CSV</button>
-                <button id="bp-restart">从头重扫</button><button id="bp-clear">清空当前搜索</button>
+                <button id="bp-history">导出全部历史</button><button id="bp-clear">清空当前搜索</button>
                 <button id="bp-legacy" hidden>导出旧版数据</button>
             </div>
-            <div class="bp-note">自动采集按当前网址参数运行。网址未体现的筛选请用“采集当前页”。名称来自页面或接口，不保证工商全称。接口受限会停止，请在网站正常完成登录或验证。</div>
+            <div class="bp-note">地区和关键词以 Boss 页面选择为准。只收集已加载的公司卡片，不调用旧接口。需要时请手动翻页；名称不保证工商全称。网址不变的筛选结果会合并保存。</div>
             <div class="bp-status" id="bp-status" role="status" aria-live="polite"></div>
         </div>`;
     document.body.appendChild(panel);
     const ui = {};
-    for (const id of ['body', 'target', 'count', 'pages', 'limit', 'start', 'dom', 'export', 'restart', 'clear', 'legacy', 'status', 'collapse']) {
+    for (const id of ['body', 'target', 'count', 'autoscroll', 'start', 'dom', 'export', 'history', 'clear', 'legacy', 'status', 'collapse']) {
         ui[id] = panel.querySelector(`#bp-${id}`);
     }
 
@@ -370,20 +335,17 @@
         ui.target.textContent = `当前搜索：${context.label}`;
         ui.target.title = context.url;
         ui.count.textContent = String(state.companies.length);
-        ui.pages.textContent = String(state.pagesDone);
-        ui.start.textContent = activeRun ? '暂停' : '开始 / 继续';
-        ui.dom.disabled = !!activeRun;
-        ui.limit.disabled = !!activeRun;
+        ui.start.textContent = activeRun ? '暂停' : '开始采集';
         ui.legacy.hidden = !legacyItems.length;
         ui.status.textContent = message;
         ui.status.className = `bp-status ${messageType}`;
     }
     function setStatus(text, type = '') { message = text; messageType = type; updatePanel(); }
-    ui.start.onclick = () => activeRun ? stopRun() : void crawlLoop();
+    ui.start.onclick = () => activeRun ? stopRun() : startRun();
     ui.dom.onclick = collectCurrentPage;
     ui.export.onclick = () => { if (!syncContext()) exportCSV(); };
     ui.legacy.onclick = () => exportCSV(legacyItems, '旧版历史_来源条件未核验');
-    ui.restart.onclick = () => resetProgress(false);
+    ui.history.onclick = () => exportCSV(allHistory(), '全部历史');
     ui.clear.onclick = () => resetProgress(true);
     ui.collapse.onclick = () => {
         collapsed = !collapsed;
@@ -395,7 +357,16 @@
     if (storageIssue) { message = storageIssue; messageType = 'error'; }
     else if (legacyItems.length) message = '旧版数据已保留，可单独导出；旧版页码不沿用，以免继承重复页进度。';
     updatePanel();
-    // SPA 搜索切换不一定触发页面刷新；每次请求返回时也会同步检查。
+    // 搜索/筛选操作时先暂停，避免过渡页面混入结果。
+    function pauseForFilter(event) {
+        if (!activeRun || !event.target.closest || event.target.closest('#bp-panel')) return;
+        if (event.type === 'change' || event.target.closest('.search-box, .job-search-box, .search-filter, .filter-box, .filter-select-box, .city-select, .expect-item')) {
+            stopRun('检测到页面筛选操作，已暂停。等结果加载后再继续。');
+        }
+    }
+    document.addEventListener('change', pauseForFilter, true);
+    document.addEventListener('click', pauseForFilter, true);
+    // SPA 搜索切换不一定刷新页面。
     setInterval(syncContext, 1000);
     window.addEventListener('pagehide', () => stopRun());
 })();

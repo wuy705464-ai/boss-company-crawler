@@ -1,11 +1,11 @@
 {
   "name": "boss-company-crawler",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": true,
   "description": "Boss company display-name collector for Tampermonkey",
   "scripts": {
     "check": "node --check boss_company_crawler.user.js",
-    "test": "node --test tests/crawler.test.cjs"
+    "test": "node --test tests/page-collector.test.cjs"
   },
   "engines": { "node": ">=20" }
 }
